@@ -31,8 +31,8 @@ PythonInterface <- setRefClass("PythonInterface",
                      }
              expr <- gettextf("_R_value = value_for_R(%s, %s, %s)",
                              pyExpr, deparse(key), pySend)
-             python.exec(expr)
-             string <- python.get("_R_value")
+             PythonCommand(expr)
+             string <- reticulate::py_eval("_R_value") #? reticulate has no version of python.get()
              XR::valueFromServer(string, key, get, .self)
          },
     ServerClassDef = function(Class, module = "", example = TRUE ) {
@@ -81,24 +81,25 @@ the first line of the text.'
     PythonCommand = function(strings) {
         'A low-level command execution, needed for initializing.  Normally should not be used by applications
 since it does no error checking; use $Command() instead.'
-        python.exec(strings)
+        reticulate::py_run_string(strings, convert = FALSE)
     },
     ServerSerialize = function(key, file) {
         'Serializing and unserializing in the Python interface use the pickle structure in Python.
 Serialization does not rely on the R equivalent object.'
         Command("pickle_for_R(%s, %s)", key, file)
     },
-                                   ServerUnserialize = function(file, all) {
+                                   ServerUnserialize = function(file, all = FALSE) {
        'The Python unserialize using unpickle'
-        value <- Eval("start_unpickle(%s)", file, .get = FALSE)
+       value <- Eval("start_unpickle(%s)", file, .get = FALSE)
+       size <- 0L
         on.exit(Command("end_unpickle()"))
         repeat {
             obj <- Eval("unpickle_for_R(%s)", value, .get = TRUE)
             if(identical(obj, FALSE)) # => EOF
                 break
-            value@size <- value@size + 1L
+            size <- size + 1L
         }
-        if(!all && (value@size == 1L))
+        if(!all && (size == 1L))
             value <- Eval("%s[0]", value, .get = FALSE)
         value
     },
@@ -114,31 +115,21 @@ Serialization does not rely on the R equivalent object.'
     ## replaces the XR method for Import()
     Import = function(module, ...)  {
         'The Python version of this method replaces the general version in XR with the "import" or
-"from ... import" directives in Python as appropriate.'
+"from ... import" directives in Python as appropriate.  Returns the `reticulate` version of the module object, which can be used directly'
         members <- unlist(c(...))
         imported <- base::exists(module, envir = modules)
-        if(imported && is.null(members)) # the usual case
-            return(TRUE)
-        ## has this been done before?
-        if(imported) {
-            hasDone <- base::get(module, envir = modules)
-            if(length(members)) {
-                if(all(members %in% hasDone))
-                    return(TRUE)
-            }
-            else if ( ".IMPORT" %in% hasDone)
-                return(TRUE)
-        }
-        else hasDone <- character()
-        if(length(members))
-            code <- paste("from", module, "import", paste(members, collapse = ", "))
+        if(imported) # the usual case
+            mod <- base::get(module, envir = modules)
         else {
-            code <- paste("import", module)
-            members <- ".IMPORT"
+            mod <- do.call(reticulate::import, list(module))
+            base::assign(module,mod , envir = modules)
         }
-        Command(code)
-        base::assign(module, unique(c(members, hasDone)), envir = modules)
-        return(members)
+        if(length(members)) {
+            ## TODO:  should remember what has been imported
+            code <- paste("from", module, "import", paste(members, collapse = ", "))
+            Command(code)
+        }
+        return(mod)
     },
 
 ### start a python shell
@@ -194,11 +185,13 @@ The argument `endCode` is the string to type to leave the shell, by default "exi
 #' See \code{\link{PythonInterface}} for details of the evaluator.
 #' @param ... arguments to control whether a new evaluator is started.  Normally omitted.
 #' @examples
-#' ev <- RPython()
-#' xx <- ev$Eval("[1, %s, 5]", pi)
-#' xx
-#' xx$append(4.5)
-#' ev$Command("print %s", xx)
+#' if(okPython(TRUE)) {
+#'   ev <- RPython()
+#'   xx <- ev$Eval("[1, %s, 5]", pi)
+#'   xx
+#'   xx$append(4.5)
+#'   ev$Command("print %s", xx)
+#' }
 RPython <- function(...)
     XR::getInterface(.PythonInterfaceClass, ...)
 
@@ -434,3 +427,121 @@ NULL
 #' @param object A vector object.  Calling with a non-vector is an error.
 #' @name noScalar
 NULL
+
+#' Write a File of Python Commands to Test Package Modules in Python
+#'
+#' A file of python commands will be written that set up an interactive Python session
+#' having imported the contents from a file (module) of python code in an R package.
+#' Typically, uploading such a file to \code{ipython} notebook allows the python code, along with additional or modified code, to
+#' be tested directly without interfacing from R.
+#' @param file A file name or open write connection.  The python commands generated will be written to this file.
+#' @param package The R package containing the relevent module
+#' @param module The file (module) to be imported.  Specifically, a command \code{"from ... import *"} will be generated.
+#' Omit this argument or supply it as \code{""} to suppress this command, in which case explicit commands should be provided.
+#' @param ... Additional python commands to be appended to the output file.
+#' @param RPython Should the path include the XRPython code, default \code{TRUE}, which is usually what you want.
+#' @param folder The name of the folder in the installed package; the default is the suggested \code{"python"}; that is, the installed
+#' version of folder \code{"inst/python"} in the source for the package.  Note that it's the installed version; changes to the source
+#' code must be installed to show up in the output.
+ipython <- function(file, package, module = "", ..., RPython = TRUE, folder = "python") {
+    dots <- list(...)
+    output <- "import sys"
+    if(RPython)
+        output <- c(output, paste0("sys.path.append(",nameQuote(system.file("python", package = "XRPython")),")"),
+                    paste0("sys.path.append(", nameQuote(system.file(folder, package = package)), ")"))
+    if(nzchar(module))
+        output <- c(output, paste0("from ", module, " import *"))
+    ## else expect commands in ...
+    for( more in dots) {
+        if(is.character(more))
+            output <- c(output, more)
+        else
+            stop("... arguments should be python commands")
+    }
+    writeLines(output, file)
+    invisible(output)
+}
+
+#' Test if a Proxy Object is an Instance of a Python Type
+#'
+#' Applies the Python function \code{isinstance()} to \code{object}.  NOTE:  this function should be used to test inheritance on the Python side,
+#' even if there are proxy classes for everything involved.  It is not true (with the present version of the package) that inheritance in Python
+#' corresponds to inheritance in R for the proxy classes.
+#' @param object Any object.  The function returns \code{FALSE} without further testing if the object is not a proxy object.
+#' @param type A character string corresponding to the Python type (not to the name of a proxy class for the type).
+#'
+#' A Python error will result
+#' if there is no such type, or if \code{object} is a proxy from another language.
+#' The implementation diverges from a direct mapping into the Python \code{isinstance} to handle a Python bizarre for functions:  although \code{type(f)}
+#' causes you to think functions have the obvious type, that doesn't work in \code{isinstance}.  So the R code uses what works for this case.
+#' (Before we get too sarcastic, the problem is similar to that in R from primitives, making \code{class(f)} and \code{typeof(f)} confusing.)
+#' @param .ev an XRPython evaluator, by default and usually the current evaluator.
+isinstance <- function(object, type, .ev = RPython()) {
+    if(XR::isProxy(object))
+        switch(type, `function` = .ev$Eval("callable(%s)", object),
+               .ev$Eval("isinstance(%s,%s)", object, as.name(type)))
+    else
+        FALSE
+}
+ 
+#' Convert Proxy Objects between XRPython and reticulate
+#'
+#' Packages XRPython and reticulate both support proxies for Python objects; that is, R objects that are
+#' proxies for objects created in Python by evaluations in the respective packages.  Function \code{fromRtclt()}
+#' returns the equivalent XRPython proxy object given a reticulate object.
+#' Function \code{toRtclt()} returns the equivalent reticulate proxy object given an XRPython object.
+#' Normally, no copying is involved in either direction.
+#'
+#' @param obj a proxy object, computed in XRPython for \code{toRtclt} or by reticulate for \code{fromRtclt}
+#' @param .ev an XRPython evaluator, by default and usually the current evaluator.
+#' @name convert
+NULL
+
+#' @describeIn convert
+#' Convert from reticulate to XRPython
+fromRtclt <- function(obj, .ev = XRPython::RPython()) {
+    rpy <- .ev$Import("RPython")
+    key <- .ev$ProxyName()
+    ## call as a reticulate expression to store obj, return proxy with this key
+    robj <- rpy$proxy_or_object(obj, FALSE, key)
+    XR::valueFromServer(robj, key, FALSE, .ev)
+}
+
+#' @describeIn convert
+#' Convert from XRPython to reticulate
+toRtclt <- function(obj, .ev = XRPython::RPython()) {
+    key <- XR::proxyName(obj)
+    reticulate::py_run_string("import RPython")
+    reticulate::py_eval(gettextf("RPython._for_R[%s]", deparse(key)), convert = FALSE)
+}
+
+#' Check for a Valid Python for Interface
+#'
+#' The function returns true or false according to whether a Python interface can be established.  This
+#' will fail if no Python exists, if it is incompatible with this version of XRPython (e.g., 32 vs 64 bits
+#' in Windows), or if for some reason it can't evaluate a trivial expression correctly.  Warnings are printed
+#' but ignored.
+#'
+#' @param verbose Should a message with the cause of a failure be reported?  Default \code{FALSE}.
+okPython <- function(verbose = FALSE) {
+    ev <- tryCatch(RPython(), error = function(e)e)
+    if(is(ev, "PythonInterface")) {
+        test <- tryCatch(ev$Eval("1"), error = function(e)e)
+        if(identical(all.equal(test, 1), TRUE))
+            TRUE
+        else {
+            if(verbose)
+                message("Attempt to evalute 1 in Python got: ", test)
+            FALSE
+        }
+    }
+    else {
+        if(verbose) {
+            if(is(ev, "error"))
+                message("Error in creating evaluator: ", conditionMessage(ev))
+            else
+                message("Expected PythonInterface object, got class: ", class(ev))
+        }
+        FALSE
+    }
+}
